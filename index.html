@@ -263,18 +263,22 @@ __      __   _  __   ____  __
 	}
 
 	//Actual CheerpX and bash specific logic
-	function runBash()
+	async function runBash()
 	{
 		// cmd, cwd, args and env are replaced by the Github actions workflow.
 		var cmd = CMD;
 		var args = ARGS;
 		var env = ENV;
 		var cwd = CWD;
+		var device_type = DEVICE_TYPE;
+		var image_url = IMAGE_URL;
 		// Reasonable defaults for local deployments
 		// var cmd = "/bin/bash";
 		// var args = ["--login"];
 		// var env = ["HOME=/home/user", "TERM=xterm", "USER=user", "SHELL=/bin/bash", "EDITOR=vim", "LANG=en_US.UTF-8", "LC_ALL=C"];
 		// var cwd = "/home/user";
+		// var device_type = "bytes";
+		// var image_url = "/your_local_image.ext2";
 		const structure = {
 			cmd: cmd,
 			args: args,
@@ -337,7 +341,54 @@ __      __   _  __   ____  __
 			printOnTerm.printError(printOnTerm.getErrorMessage(err));
 		}
 		// The device url and type are replaced by Github Actions.
-		CheerpXApp.create({devices:[{type:DEVICE_TYPE,url:IMAGE_URL,name:"block1"}],mounts:[{type:"ext2",dev:"block1",path:"/"},{type:"cheerpOS",dev:"/app",path:"/app"},{type:"cheerpOS",dev:"/str",path:"/data"},{type:"devs",dev:"",path:"/dev"},{type:"proc",dev:"",path:"/proc"}], networkInterface: networkInterface}).then(runTest, failCallback);
+		var blockDevice;
+		switch (device_type)
+		{
+			case "cloud":
+				try
+				{
+					blockDevice = await CheerpX.CloudDevice.create(image_url);
+				}
+				catch(e)
+				{
+					// Report the failure and try again with plain HTTP
+					var wssProtocol = "wss:";
+					if(image_url.startsWith(wssProtocol))
+					{
+						// WebSocket protocol failed, try agin using plain HTTP
+						plausible("WS Disk failure");
+						image_url = "https:" + image_url.substr(wssProtocol.length);
+						blockDevice = await CheerpX.CloudDevice.create(image_url);
+					}
+					else
+					{
+						// No other recovery option
+						throw e;
+					}
+				}
+				break;
+			case "bytes":
+				try
+				{
+					blockDevice = await CheerpX.HttpBytesDevice.create(image_url);
+				}
+				catch(e)
+				{
+					printOnTerm.printError([e]);
+					throw e;
+				}
+				break;
+			case "github":
+				blockDevice = await CheerpX.GitHubDevice.create(image_url);
+				break;
+			default:
+				console.log("Unrecognized device type");
+				return;
+		}
+		var overlayDevice = await CheerpX.OverlayDevice.create(blockDevice, await CheerpX.IDBDevice.create("block1"));
+		var webDevice = await CheerpX.WebDevice.create("");
+		var dataDevice = await CheerpX.DataDevice.create();
+		CheerpX.Linux.create({mounts:[{type:"ext2",dev:overlayDevice,path:"/"},{type:"dir",dev:webDevice,path:"/app"},{type:"dir",dev:dataDevice,path:"/data"},{type:"devs",path:"/dev"},{type:"proc",path:"/proc"}], networkInterface: networkInterface}).then(runTest, failCallback);
 	}
 	function initialMessage()
 	{
@@ -348,7 +399,7 @@ __      __   _  __   ____  __
 	async function loadCX()
 	{
 		// Find the latest build
-		var r = await fetch("https://cheerpxdemos.leaningtech.com/publicdeploy/LATEST.txt");
+		var r = await fetch("https://cxrtnc.leaningtech.com/LATEST.txt");
 		var url = await r.text();
 		url = url.trim();
 		var script = document.createElement('script');
