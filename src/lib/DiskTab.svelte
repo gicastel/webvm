@@ -8,15 +8,19 @@
 	{
 		if(state == "START")
 			state = "CONFIRM";
-		else
+		else if (state == "CONFIRM") {
+			state = "RESETTING";
 			dispatch('reset');
+		}
 	}
 	function getButtonText(state)
 	{
 		if(state == "START")
 			return "Reset disk";
+		else if (state == "RESETTING")
+			return "Resetting...";
 		else
-			return "Reset disk. Confirm?"
+			return "Reset disk. Confirm?";
 	}
 	function getBgColor(state)
 	{
@@ -48,6 +52,8 @@
 </PanelButton>
 {#if state == "CONFIRM"}
 	<p><span class="font-bold">Warning: </span>WebVM will reload</p>
+{:else if state == "RESETTING"}
+	<p><span class="font-bold">Reset in progress: </span>Please wait...</p>
 {:else}
 	<p><span class="font-bold">Backend latency: </span>{$diskLatency}ms</p>
 {/if}

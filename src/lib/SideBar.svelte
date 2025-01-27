@@ -4,16 +4,18 @@
 	import NetworkingTab from './NetworkingTab.svelte';
 	import CpuTab from './CpuTab.svelte';
 	import DiskTab from './DiskTab.svelte';
+	import AnthropicTab from './AnthropicTab.svelte';
 	import PostsTab from './PostsTab.svelte';
 	import DiscordTab from './DiscordTab.svelte';
 	import GitHubTab from './GitHubTab.svelte';
-	import { cpuActivity, diskActivity } from './activities.js'
+	import { cpuActivity, diskActivity, aiActivity } from './activities.js'
 
 	const icons = [
 		{ icon: 'fas fa-info-circle', info: 'Information', activity: null },
 		{ icon: 'fas fa-wifi', info: 'Networking', activity: null },
 		{ icon: 'fas fa-microchip', info: 'CPU', activity: cpuActivity },
 		{ icon: 'fas fa-compact-disc', info: 'Disk', activity: diskActivity },
+		{ icon: 'fas fa-robot', info: 'ClaudeAI', activity: aiActivity },
 		null,
 		{ icon: 'fas fa-book-open', info: 'Posts', activity: null },
 		{ icon: 'fab fa-discord', info: 'Discord', activity: null },
@@ -29,6 +31,8 @@
 	function hideInfo() {
 		activeInfo = null;
 	}
+
+	export let handleTool;
 </script>
 
 <div class="flex flex-row w-14 h-full bg-neutral-700" on:mouseleave={hideInfo}>
@@ -46,15 +50,19 @@
 			{/if}
 		{/each}
 	</div>
-	<div class="flex flex-col gap-5 shrink-0 w-60 h-full z-10 p-2 bg-neutral-600 text-gray-100" class:hidden={!activeInfo}>
+	<div class="flex flex-col gap-5 shrink-0 w-80 h-full z-10 p-2 bg-neutral-600 text-gray-100 opacity-95" class:hidden={!activeInfo}>
 		{#if activeInfo === 'Information'}
-			<InformationTab/>
+			<InformationTab>
+				<slot></slot>
+			</InformationTab>
 		{:else if activeInfo === 'Networking'}
 			<NetworkingTab on:connect/>
 		{:else if activeInfo === 'CPU'}
 			<CpuTab/>
 		{:else if activeInfo === 'Disk'}
 			<DiskTab on:reset/>
+		{:else if activeInfo === 'ClaudeAI'}
+			<AnthropicTab handleTool={handleTool} />
 		{:else if activeInfo === 'Posts'}
 			<PostsTab/>
 		{:else if activeInfo === 'Discord'}

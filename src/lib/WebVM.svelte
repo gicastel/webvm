@@ -1,5 +1,6 @@
 <script>
 	import { onMount } from 'svelte';
+	import { get } from 'svelte/store';
 	import Nav from 'labs/packages/global-navbar/src/Nav.svelte';
 	import SideBar from '$lib/SideBar.svelte';
 	import '$lib/global.css';
@@ -8,6 +9,7 @@
 	import { networkInterface, startLogin } from '$lib/network.js'
 	import { cpuActivity, diskActivity, cpuPercentage, diskLatency } from '$lib/activities.js'
 	import { introMessage, errorMessage, unexpectedErrorMessage } from '$lib/messages.js'
+	import { displayConfig } from '$lib/anthropic.js'
 
 	export let configObj = null;
 	export let processCallback = null;
@@ -23,6 +25,9 @@
 	var blockCache = null;
 	var processCount = 0;
 	var curVT = 0;
+	var lastScreenshot = null;
+	var screenshotCanvas = null;
+	var screenshotCtx = null;
 	function writeData(buf, vt)
 	{
 		if(vt != 1)
@@ -83,7 +88,7 @@
 				eTime = limitTime;
 			if(e.state == "ready")
 			{
-				// Inactive state, add the time frome lastActiveTime
+				// Inactive state, add the time from lastActiveTime
 				totalActiveTime += (eTime - lastActiveTime);
 				lastWasActive = false;
 			}
@@ -136,16 +141,30 @@
 	}
 	function setScreenSize(display)
 	{
-		var mult = 1.0;
+		var internalMult = 1.0;
 		var displayWidth = display.offsetWidth;
 		var displayHeight = display.offsetHeight;
 		var minWidth = 1024;
 		var minHeight = 768;
 		if(displayWidth < minWidth)
-			mult = minWidth / displayWidth;
+			internalMult = minWidth / displayWidth;
 		if(displayHeight < minHeight)
-			mult = Math.max(mult, minHeight / displayHeight);
-		cx.setKmsCanvas(display, displayWidth * mult, displayHeight * mult);
+			internalMult = Math.max(internalMult, minHeight / displayHeight);
+		var internalWidth = Math.floor(displayWidth * internalMult);
+		var internalHeight = Math.floor(displayHeight * internalMult);
+		cx.setKmsCanvas(display, internalWidth, internalHeight);
+		// Compute the size to be used for AI screenshots
+		var screenshotMult = 1.0;
+		var maxWidth = 1024;
+		var maxHeight = 768;
+		if(internalWidth > maxWidth)
+			screenshotMult = maxWidth / internalWidth;
+		if(internalHeight > maxHeight)
+			screenshotMult = Math.min(screenshotMult, maxHeight / internalHeight);
+		var screenshotWidth = Math.floor(internalWidth * screenshotMult);
+		var screenshotHeight = Math.floor(internalHeight * screenshotMult);
+		// Track the state of the mouse as requested by the AI, to avoid losing the position due to user movement
+		displayConfig.set({width: screenshotWidth, height: screenshotHeight, mouseX: 0, mouseY: 0, mouseMult: internalMult * screenshotMult});
 	}
 	var curInnerWidth = 0;
 	var curInnerHeight = 0;
@@ -261,6 +280,7 @@
 		blockCache = await CheerpX.IDBDevice.create(cacheId);
 		var overlayDevice = await CheerpX.OverlayDevice.create(blockDevice, blockCache);
 		var webDevice = await CheerpX.WebDevice.create("");
+		var documentsDevice = await CheerpX.WebDevice.create("documents");
 		var dataDevice = await CheerpX.DataDevice.create();
 		var mountPoints = [
 			// The root filesystem, as an Ext2 image
@@ -271,8 +291,14 @@
 			{type:"dir", dev:dataDevice, path:"/data"},
 			// Automatically created device files
 			{type:"devs", path:"/dev"},
+			// Pseudo-terminals
+			{type:"devpts", path:"/dev/pts"},
 			// The Linux 'proc' filesystem which provides information about running processes
-			{type:"proc", path:"/proc"}
+			{type:"proc", path:"/proc"},
+			// The Linux 'sysfs' filesystem which is used to enumerate emulated devices
+			{type:"sys", path:"/sys"},
+			// Convenient access to sample documents in the user directory
+			{type:"dir", dev:documentsDevice, path:"/home/user/documents"}
 		];
 		try
 		{
@@ -317,15 +343,265 @@
 		await blockCache.reset();
 		location.reload();
 	}
+	function getKmsInputElement()
+	{
+		// Find the CheerpX textare, it's attached to the body element
+		for(const node of document.body.children)
+		{
+			if(node.tagName == "TEXTAREA")
+				return node;
+		}
+		return null;
+	}
+	async function yieldHelper(timeout)
+	{
+		return new Promise(function(f2, r2)
+		{
+			setTimeout(f2, timeout);
+		});
+	}
+	async function kmsSendChar(textArea, charStr)
+	{
+		textArea.value = "_" + charStr;
+		var ke = new KeyboardEvent("keydown");
+		textArea.dispatchEvent(ke);
+		var ke = new KeyboardEvent("keyup");
+		textArea.dispatchEvent(ke);
+		await yieldHelper(0);
+	}
+	async function handleTool(tool)
+	{
+		if(tool.command)
+		{
+			var sentinel = "# End of AI command";
+			var buffer = term.buffer.active;
+			// Get the current cursor position
+			var marker = term.registerMarker();
+			var startLine = marker.line;
+			marker.dispose();
+			var ret = new Promise(function(f, r)
+			{
+				var callbackDisposer = term.onWriteParsed(function()
+				{
+					var curLength = buffer.length;
+					// Accumulate the output and see if the sentinel has been printed
+					var output = "";
+					for(var i=startLine + 1;i<curLength;i++)
+					{
+						var curLine = buffer.getLine(i).translateToString(true, 0, term.cols);;
+						if(curLine.indexOf(sentinel) >= 0)
+						{
+							// We are done, cleanup and return
+							callbackDisposer.dispose();
+							return f(output);
+						}
+						output += curLine + "\n";
+					}
+				});
+			});
+			term.input(tool.command);
+			term.input("\n");
+			term.input(sentinel);
+			term.input("\n");
+			return ret;
+		}
+		else if(tool.action)
+		{
+			// Desktop control
+			// TODO: We should have an explicit API to interact with CheerpX display
+			switch(tool.action)
+			{
+				case "screenshot":
+				{
+					// Insert a 3 seconds delay unconditionally, the reference implementation uses 2
+					await yieldHelper(3000);
+					var delayCount = 0;
+					var display = document.getElementById("display");
+					var dc = get(displayConfig);
+					if(screenshotCanvas == null)
+					{
+						screenshotCanvas = document.createElement("canvas");
+						screenshotCtx = screenshotCanvas.getContext("2d");
+					}
+					if(screenshotCanvas.width != dc.width || screenshotCanvas.height != dc.height)
+					{
+						screenshotCanvas.width = dc.width;
+						screenshotCanvas.height = dc.height;
+					}
+					while(1)
+					{
+						// Resize the canvas to a Claude compatible size
+						screenshotCtx.drawImage(display, 0, 0, display.width, display.height, 0, 0, dc.width, dc.height);
+						var dataUrl = screenshotCanvas.toDataURL("image/png");
+						if(dataUrl == lastScreenshot)
+						{
+							// Delay at most 3 times
+							if(delayCount < 3)
+							{
+								// TODO: Defensive message, validate and remove
+								console.warn("Identical screenshot, rate limiting");
+								delayCount++;
+								// Wait some time and retry
+								await yieldHelper(5000);
+								continue;
+							}
+						}
+						lastScreenshot = dataUrl;
+						// Remove prefix from the encoded data
+						dataUrl = dataUrl.substring("data:image/png;base64,".length);
+						var imageSrc = { type: "base64", media_type: "image/png", data: dataUrl };
+						var contentObj = { type: "image", source: imageSrc };
+						return [ contentObj ];
+					}
+				}
+				case "mouse_move":
+				{
+					var coords = tool.coordinate;
+					var dc = get(displayConfig);
+					dc.mouseX = coords[0] / dc.mouseMult;
+					dc.mouseY = coords[1] / dc.mouseMult;
+					var display = document.getElementById("display");
+					var clientRect = display.getBoundingClientRect();
+					var me = new MouseEvent('mousemove', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top });
+					display.dispatchEvent(me);
+					return null;
+				}
+				case "left_click":
+				{
+					var dc = get(displayConfig);
+					var display = document.getElementById("display");
+					var clientRect = display.getBoundingClientRect();
+					var me = new MouseEvent('mousedown', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top, button: 0 });
+					display.dispatchEvent(me);
+					var me = new MouseEvent('mouseup', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top, button: 0 });
+					display.dispatchEvent(me);
+					return null;
+				}
+				case "right_click":
+				{
+					var dc = get(displayConfig);
+					var display = document.getElementById("display");
+					var clientRect = display.getBoundingClientRect();
+					var me = new MouseEvent('mousedown', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top, button: 2 });
+					display.dispatchEvent(me);
+					var me = new MouseEvent('mouseup', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top, button: 2 });
+					display.dispatchEvent(me);
+					return null;
+				}
+				case "type":
+				{
+					var str = tool.text;
+					return new Promise(async function(f, r)
+					{
+						var textArea = getKmsInputElement();
+						for(var i=0;i<str.length;i++)
+						{
+							await kmsSendChar(textArea, str[i]);
+						}
+						f(null);
+					});
+				}
+				case "key":
+				{
+					var textArea = getKmsInputElement();
+					var key = tool.text;
+					// Support arbitrary order of modifiers
+					var isCtrl = false;
+					var isAlt = false;
+					var isShift = false;
+					while(1)
+					{
+						if(key.startsWith("shift+"))
+						{
+							isShift = true;
+							key = key.substr("shift+".length);
+							var ke = new KeyboardEvent("keydown", {keyCode: 0x10});
+							textArea.dispatchEvent(ke);
+							await yieldHelper(0);
+							continue;
+						}
+						else if(key.startsWith("ctrl+"))
+						{
+							isCtrl = true;
+							key = key.substr("ctrl+".length);
+							var ke = new KeyboardEvent("keydown", {keyCode: 0x11});
+							textArea.dispatchEvent(ke);
+							await yieldHelper(0);
+							continue;
+						}
+						else if(key.startsWith("alt+"))
+						{
+							isAlt = true;
+							key = key.substr("alt+".length);
+							var ke = new KeyboardEvent("keydown", {keyCode: 0x12});
+							textArea.dispatchEvent(ke);
+							await yieldHelper(0);
+							continue;
+						}
+						break;
+					}
+					var ret = null;
+					// Dispatch single chars directly and parse the rest
+					if(key.length == 1)
+					{
+						await kmsSendChar(textArea, key);
+					}
+					else
+					{
+						switch(tool.text)
+						{
+							case "Return":
+								await kmsSendChar(textArea, "\n");
+								break;
+							default:
+								// TODO: Support more key combinations
+								ret = new Error(`Error: Invalid key '${tool.text}'`);
+						}
+					}
+					if(isShift)
+					{
+						var ke = new KeyboardEvent("keyup", {keyCode: 0x10});
+						textArea.dispatchEvent(ke);
+						await yieldHelper(0);
+					}
+					if(isCtrl)
+					{
+						var ke = new KeyboardEvent("keyup", {keyCode: 0x11});
+						textArea.dispatchEvent(ke);
+						await yieldHelper(0);
+					}
+					if(isAlt)
+					{
+						var ke = new KeyboardEvent("keyup", {keyCode: 0x12});
+						textArea.dispatchEvent(ke);
+						await yieldHelper(0);
+					}
+					return ret;
+				}
+				default:
+				{
+					break;
+				}
+			}
+			return new Error("Error: Invalid action");
+		}
+		else
+		{
+			// We can get there due to model hallucinations
+			return new Error("Error: Invalid tool syntax");
+		}
+	}
 </script>
 
 <main class="relative w-full h-full">
 	<Nav />
 	<div class="absolute top-10 bottom-0 left-0 right-0">
-		<SideBar on:connect={handleConnect} on:reset={handleReset}/>
+		<SideBar on:connect={handleConnect} on:reset={handleReset} handleTool={handleTool}>
+			<slot></slot>
+		</SideBar>
 		{#if configObj.needsDisplay}
 			<div class="absolute top-0 bottom-0 left-14 right-0">
-				<canvas class="w-full h-full" id="display"></canvas>
+				<canvas class="w-full h-full cursor-none" id="display"></canvas>
 			</div>
 		{/if}
 		<div class="absolute top-0 bottom-0 left-14 right-0 p-1 scrollbar" id="console">
