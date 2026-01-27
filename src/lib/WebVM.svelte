@@ -1,5 +1,5 @@
 <script>
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { get } from 'svelte/store';
 	import Nav from 'labs/packages/global-navbar/src/Nav.svelte';
 	import SideBar from '$lib/SideBar.svelte';
@@ -9,7 +9,8 @@
 	import { networkInterface, startLogin } from '$lib/network.js'
 	import { cpuActivity, diskActivity, cpuPercentage, diskLatency } from '$lib/activities.js'
 	import { introMessage, errorMessage, unexpectedErrorMessage } from '$lib/messages.js'
-	import { displayConfig } from '$lib/anthropic.js'
+	import { displayConfig, handleToolImpl } from '$lib/anthropic.js'
+	import { tryPlausible } from '$lib/plausible.js'
 
 	export let configObj = null;
 	export let processCallback = null;
@@ -25,9 +26,7 @@
 	var blockCache = null;
 	var processCount = 0;
 	var curVT = 0;
-	var lastScreenshot = null;
-	var screenshotCanvas = null;
-	var screenshotCtx = null;
+	var sideBarPinned = false;
 	function writeData(buf, vt)
 	{
 		if(vt != 1)
@@ -164,7 +163,7 @@
 		var screenshotWidth = Math.floor(internalWidth * screenshotMult);
 		var screenshotHeight = Math.floor(internalHeight * screenshotMult);
 		// Track the state of the mouse as requested by the AI, to avoid losing the position due to user movement
-		displayConfig.set({width: screenshotWidth, height: screenshotHeight, mouseX: 0, mouseY: 0, mouseMult: internalMult * screenshotMult});
+		displayConfig.set({width: screenshotWidth, height: screenshotHeight, mouseMult: internalMult * screenshotMult});
 	}
 	var curInnerWidth = 0;
 	var curInnerHeight = 0;
@@ -175,6 +174,10 @@
 			return;
 		curInnerWidth = window.innerWidth;
 		curInnerHeight = window.innerHeight;
+		triggerResize();
+	}
+	function triggerResize()
+	{
 		term.options.fontSize = computeXTermFontSize();
 		fitAddon.fit();
 		const display = document.getElementById("display");
@@ -232,7 +235,7 @@
 		// Raise the display to the foreground
 		const display = document.getElementById("display");
 		display.parentElement.style.zIndex = 5;
-		plausible("Display activated");
+		tryPlausible("Display activated");
 	}
 	function handleProcessCreated()
 	{
@@ -258,7 +261,7 @@
 					if(configObj.diskImageUrl.startsWith(wssProtocol))
 					{
 						// WebSocket protocol failed, try agin using plain HTTP
-						plausible("WS Disk failure");
+						tryPlausible("WS Disk failure");
 						blockDevice = await CheerpX.CloudDevice.create("https:" + configObj.diskImageUrl.substr(wssProtocol.length));
 					}
 					else
@@ -332,7 +335,7 @@
 	async function handleConnect()
 	{
 		const w = window.open("login.html", "_blank");
-		await cx.networkLogin();
+		cx.networkLogin();
 		w.location.href = await startLogin();
 	}
 	async function handleReset()
@@ -343,268 +346,32 @@
 		await blockCache.reset();
 		location.reload();
 	}
-	function getKmsInputElement()
-	{
-		// Find the CheerpX textare, it's attached to the body element
-		for(const node of document.body.children)
-		{
-			if(node.tagName == "TEXTAREA")
-				return node;
-		}
-		return null;
-	}
-	async function yieldHelper(timeout)
-	{
-		return new Promise(function(f2, r2)
-		{
-			setTimeout(f2, timeout);
-		});
-	}
-	async function kmsSendChar(textArea, charStr)
-	{
-		textArea.value = "_" + charStr;
-		var ke = new KeyboardEvent("keydown");
-		textArea.dispatchEvent(ke);
-		var ke = new KeyboardEvent("keyup");
-		textArea.dispatchEvent(ke);
-		await yieldHelper(0);
-	}
 	async function handleTool(tool)
 	{
-		if(tool.command)
-		{
-			var sentinel = "# End of AI command";
-			var buffer = term.buffer.active;
-			// Get the current cursor position
-			var marker = term.registerMarker();
-			var startLine = marker.line;
-			marker.dispose();
-			var ret = new Promise(function(f, r)
-			{
-				var callbackDisposer = term.onWriteParsed(function()
-				{
-					var curLength = buffer.length;
-					// Accumulate the output and see if the sentinel has been printed
-					var output = "";
-					for(var i=startLine + 1;i<curLength;i++)
-					{
-						var curLine = buffer.getLine(i).translateToString(true, 0, term.cols);;
-						if(curLine.indexOf(sentinel) >= 0)
-						{
-							// We are done, cleanup and return
-							callbackDisposer.dispose();
-							return f(output);
-						}
-						output += curLine + "\n";
-					}
-				});
-			});
-			term.input(tool.command);
-			term.input("\n");
-			term.input(sentinel);
-			term.input("\n");
-			return ret;
-		}
-		else if(tool.action)
-		{
-			// Desktop control
-			// TODO: We should have an explicit API to interact with CheerpX display
-			switch(tool.action)
-			{
-				case "screenshot":
-				{
-					// Insert a 3 seconds delay unconditionally, the reference implementation uses 2
-					await yieldHelper(3000);
-					var delayCount = 0;
-					var display = document.getElementById("display");
-					var dc = get(displayConfig);
-					if(screenshotCanvas == null)
-					{
-						screenshotCanvas = document.createElement("canvas");
-						screenshotCtx = screenshotCanvas.getContext("2d");
-					}
-					if(screenshotCanvas.width != dc.width || screenshotCanvas.height != dc.height)
-					{
-						screenshotCanvas.width = dc.width;
-						screenshotCanvas.height = dc.height;
-					}
-					while(1)
-					{
-						// Resize the canvas to a Claude compatible size
-						screenshotCtx.drawImage(display, 0, 0, display.width, display.height, 0, 0, dc.width, dc.height);
-						var dataUrl = screenshotCanvas.toDataURL("image/png");
-						if(dataUrl == lastScreenshot)
-						{
-							// Delay at most 3 times
-							if(delayCount < 3)
-							{
-								// TODO: Defensive message, validate and remove
-								console.warn("Identical screenshot, rate limiting");
-								delayCount++;
-								// Wait some time and retry
-								await yieldHelper(5000);
-								continue;
-							}
-						}
-						lastScreenshot = dataUrl;
-						// Remove prefix from the encoded data
-						dataUrl = dataUrl.substring("data:image/png;base64,".length);
-						var imageSrc = { type: "base64", media_type: "image/png", data: dataUrl };
-						var contentObj = { type: "image", source: imageSrc };
-						return [ contentObj ];
-					}
-				}
-				case "mouse_move":
-				{
-					var coords = tool.coordinate;
-					var dc = get(displayConfig);
-					dc.mouseX = coords[0] / dc.mouseMult;
-					dc.mouseY = coords[1] / dc.mouseMult;
-					var display = document.getElementById("display");
-					var clientRect = display.getBoundingClientRect();
-					var me = new MouseEvent('mousemove', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top });
-					display.dispatchEvent(me);
-					return null;
-				}
-				case "left_click":
-				{
-					var dc = get(displayConfig);
-					var display = document.getElementById("display");
-					var clientRect = display.getBoundingClientRect();
-					var me = new MouseEvent('mousedown', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top, button: 0 });
-					display.dispatchEvent(me);
-					var me = new MouseEvent('mouseup', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top, button: 0 });
-					display.dispatchEvent(me);
-					return null;
-				}
-				case "right_click":
-				{
-					var dc = get(displayConfig);
-					var display = document.getElementById("display");
-					var clientRect = display.getBoundingClientRect();
-					var me = new MouseEvent('mousedown', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top, button: 2 });
-					display.dispatchEvent(me);
-					var me = new MouseEvent('mouseup', { clientX: dc.mouseX + clientRect.left, clientY: dc.mouseY + clientRect.top, button: 2 });
-					display.dispatchEvent(me);
-					return null;
-				}
-				case "type":
-				{
-					var str = tool.text;
-					return new Promise(async function(f, r)
-					{
-						var textArea = getKmsInputElement();
-						for(var i=0;i<str.length;i++)
-						{
-							await kmsSendChar(textArea, str[i]);
-						}
-						f(null);
-					});
-				}
-				case "key":
-				{
-					var textArea = getKmsInputElement();
-					var key = tool.text;
-					// Support arbitrary order of modifiers
-					var isCtrl = false;
-					var isAlt = false;
-					var isShift = false;
-					while(1)
-					{
-						if(key.startsWith("shift+"))
-						{
-							isShift = true;
-							key = key.substr("shift+".length);
-							var ke = new KeyboardEvent("keydown", {keyCode: 0x10});
-							textArea.dispatchEvent(ke);
-							await yieldHelper(0);
-							continue;
-						}
-						else if(key.startsWith("ctrl+"))
-						{
-							isCtrl = true;
-							key = key.substr("ctrl+".length);
-							var ke = new KeyboardEvent("keydown", {keyCode: 0x11});
-							textArea.dispatchEvent(ke);
-							await yieldHelper(0);
-							continue;
-						}
-						else if(key.startsWith("alt+"))
-						{
-							isAlt = true;
-							key = key.substr("alt+".length);
-							var ke = new KeyboardEvent("keydown", {keyCode: 0x12});
-							textArea.dispatchEvent(ke);
-							await yieldHelper(0);
-							continue;
-						}
-						break;
-					}
-					var ret = null;
-					// Dispatch single chars directly and parse the rest
-					if(key.length == 1)
-					{
-						await kmsSendChar(textArea, key);
-					}
-					else
-					{
-						switch(tool.text)
-						{
-							case "Return":
-								await kmsSendChar(textArea, "\n");
-								break;
-							default:
-								// TODO: Support more key combinations
-								ret = new Error(`Error: Invalid key '${tool.text}'`);
-						}
-					}
-					if(isShift)
-					{
-						var ke = new KeyboardEvent("keyup", {keyCode: 0x10});
-						textArea.dispatchEvent(ke);
-						await yieldHelper(0);
-					}
-					if(isCtrl)
-					{
-						var ke = new KeyboardEvent("keyup", {keyCode: 0x11});
-						textArea.dispatchEvent(ke);
-						await yieldHelper(0);
-					}
-					if(isAlt)
-					{
-						var ke = new KeyboardEvent("keyup", {keyCode: 0x12});
-						textArea.dispatchEvent(ke);
-						await yieldHelper(0);
-					}
-					return ret;
-				}
-				default:
-				{
-					break;
-				}
-			}
-			return new Error("Error: Invalid action");
-		}
-		else
-		{
-			// We can get there due to model hallucinations
-			return new Error("Error: Invalid tool syntax");
-		}
+		return await handleToolImpl(tool, term);
+	}
+	async function handleSidebarPinChange(event)
+	{
+		sideBarPinned = event.detail;
+		// Make sure the pinning state of reflected in the layout
+		await tick();
+		// Adjust the layout based on the new sidebar state
+		triggerResize();
 	}
 </script>
 
 <main class="relative w-full h-full">
 	<Nav />
 	<div class="absolute top-10 bottom-0 left-0 right-0">
-		<SideBar on:connect={handleConnect} on:reset={handleReset} handleTool={handleTool}>
+		<SideBar on:connect={handleConnect} on:reset={handleReset} handleTool={!configObj.needsDisplay || curVT == 7 ? handleTool : null} on:sidebarPinChange={handleSidebarPinChange}>
 			<slot></slot>
 		</SideBar>
 		{#if configObj.needsDisplay}
-			<div class="absolute top-0 bottom-0 left-14 right-0">
+			<div class="absolute top-0 bottom-0 {sideBarPinned ? 'left-[23.5rem]' : 'left-14'} right-0">
 				<canvas class="w-full h-full cursor-none" id="display"></canvas>
 			</div>
 		{/if}
-		<div class="absolute top-0 bottom-0 left-14 right-0 p-1 scrollbar" id="console">
+		<div class="absolute top-0 bottom-0 {sideBarPinned ? 'left-[23.5rem]' : 'left-14'} right-0 p-1 scrollbar" id="console">
 		</div>
 	</div>
 </main>

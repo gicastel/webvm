@@ -13,15 +13,78 @@ WebVM is a server-less virtual environment running fully client-side in HTML5/We
 
 WebVM is powered by the CheerpX virtualization engine, and enables safe, sandboxed client-side execution of x86 binaries on any browser. CheerpX includes an x86-to-WebAssembly JIT compiler, a virtual block-based file system, and a Linux syscall emulator. 
 
+## Table of Contents
+
+- [Fork, deploy, customize](#fork-deploy-customize)
+- [Running WebVM locally with a custom Debian mini disk image](#run-webvm-locally-with-a-custom-debian-mini-disk-image)
+- [Example customization: Python3 REPL](#example-customization-python3-repl)
+- [How to use Claude AI](#how-to-use-claude-ai)
+- [Bugs and Issues](#bugs-and-issues)
+- [More links](#more-links)
+- [Thanks to...](#thanks-to)
+- [Versioning](#versioning)
+- [License](#license)
+
 # Enable networking
 
 Modern browsers do not provide APIs to directly use TCP or UDP. WebVM provides networking support by integrating with Tailscale, a VPN network that supports WebSockets as a transport layer.
 
-- Open the "Networking" panel from the side-bar
-- Click "Connect to Tailscale" from the panel
-- Log in to Tailscale (create an account if you don't have one)
-- Click "Connect" when prompted by Tailscale
-- If you are unfamiliar with Tailscale or would like additional information see [WebVM and Tailscale](/docs/Tailscale.md).
+1.  Open the "Networking" panel from the side-bar
+2.  Click "Connect to Tailscale" from the panel
+3.  Log in to Tailscale (create an account if you don't have one)
+4. Click "Connect" when prompted by Tailscale
+
+WebVM now has access to machines in your own local Tailscale Network!
+
+## The world wide web
+
+If you would like to access the public internet, you will need to set up an Exit Node on one of your _non-WebVM_ tailscale network devices.
+See the _"Advertise a device as an exit node"_ section of the [Tailscale Exit Node quickstart guide](https://tailscale.com/kb/1408/quick-guide-exit-nodes?tab=linux) for instructions. (The _“Use an exit node”_ section can be skipped, as WebVM automatically uses an available exit node once one is advertised).
+
+> [!NOTE]
+> While we support most network commands there are a few that rely on kernel-level features not available in modern browsers and are therefore not supported, most notably `ping`.You could use `curl` or `wget` for testing instead.
+
+(Depending on your network speed, you may need to wait a few moments for the Tailscale Wasm module to be downloaded.)
+Once that is set up:
+1. Log in with your Tailscale credentials.
+2. Go back to the WebVM tab.
+3.  The `Connect to Tailscale` button in the Networking side-panel should be replaced by your IP address.
+
+> [!TIP]
+> You can also check your connection status by checking the dot colour on the "connect to tailscale" button (which should now show your tailscale IP). On local network connectivity it will be orange, global will be green.
+
+## Using an authkey
+
+As an alternative to manually logging in, you can add your tailscale auth Key at the end of the webvm URL.
+
+`https://webvm.io/#authKey=<your-key>`
+
+It is recommended to use an ephemeral key.
+
+## Selfhosting your tailscale network
+
+We also support [headscale](https://headscale.net/stable/), a selfhosted open source implementation of the Tailscale control server.
+
+Though as headscale unfortunately doesn't support adding CORS headers. You will have to set up a proxy server to add them. Headscales instructions on doing so can be found [here](https://headscale.net/stable/ref/integration/reverse-proxy/#nginx). 
+
+Once ready, add the following line to your `location /` block in your nginx config file.
+
+``` Nginx
+ if ($http_origin = "https://webvm.io") {
+            add_header 'Access-Control-Allow-Origin' "$http_origin";
+			add_header 'Access-Control-Allow-Credentials' 'true' always;
+        }
+```
+
+
+To log in to your headscale network add `#controlUrl=<your-control-url>` to the webVM url.
+
+**Notes:**
+
+- If self hosting, replace "https://webvm.io" with your own url.
+- This is equivelant to the tailscale  `--login-server` command line option.
+- If used with authkey, don't forget to seperate the URL fragments with a `&` inbetween.
+
 
 # Fork, deploy, customize
 
@@ -45,22 +108,96 @@ Modern browsers do not provide APIs to directly use TCP or UDP. WebVM provides n
 
 You can now customize `dockerfiles/debian_mini` to suit your needs, or make a new Dockerfile from scratch. Use the `Path to Dockerfile` workflow parameter to select it.
 
-# Local deployment
+- If you would like to use our full desktop Alpine image, you can find it's dockerfile [**here**](github.com/leaningtech/alpine-image).
 
-From a local `git clone`
+- For more information on creating custom images, see our [Custom disk Image documentation](https://cheerpx.io/docs/guides/custom-images).
 
-- Download the `debian_mini` Ext2 image from [https://github.com/leaningtech/webvm/releases/](https://github.com/leaningtech/webvm/releases/)
-	- You can also build your own by selecting the "Upload GitHub release" workflow option
-	- Place the image in the repository root folder
-- Edit `config_github_terminal.js`
-	- Uncomment the default values for `CMD`, `ARGS`, `ENV` and `CWD`
-	- Replace `IMAGE_URL` with the URL (absolute or relative) for the Ext2 image. For example `"/debian_mini_20230519_5022088024.ext2"`
-- Build WebVM using `npm`, output will be placed in the `build` directory
-	- `npm install`
-	- `npm run build`
-- Start NGINX, it automatically points to the `build` directory just created
-	- `nginx -p . -c nginx.conf`
-- Visit `http://127.0.0.1:8081` and enjoy your local WebVM
+
+# Run WebVM locally with a custom Debian mini disk image
+
+### 1. Clone the WebVM Repository
+
+```sh
+git clone https://github.com/leaningtech/webvm.git
+cd webvm
+```
+
+### 2. Download the Debian mini Ext2 image
+
+Run the following command to download the Debian mini Ext2 image:
+
+```sh
+wget "https://github.com/leaningtech/webvm/releases/download/ext2_image/debian_mini_20230519_5022088024.ext2"
+```
+
+(*You can also build your own disk image by selecting the **"Upload GitHub release"** workflow option*)
+
+### 3. Update the configuration file
+
+	Edit `config_public_terminal.js` to reference your local disk image:
+
+- Replace: 
+	
+	`"wss://disks.webvm.io/debian_large_20230522_5044875331.ext2"`
+	
+	With:
+	
+	`"/disk-images/debian_mini_20230519_5022088024.ext2"`
+
+	(*Use an absolute or relative URL pointing to the disk image location.*)
+
+
+- Replace `"cloud"` with the correct disk image type: `"bytes"`
+
+	
+### 4. Build WebVM
+
+Run the following commands to install dependencies and build WebVM:
+
+```sh
+npm install
+npm run build
+```
+
+The output will be placed in the `build` directory.
+
+### 5. Configure Nginx
+
+- Create a directory for the disk image:
+
+```sh
+mkdir disk-images
+mv debian_mini_20230519_5022088024.ext2 disk-images/
+```
+
+- Modify your `nginx.conf` file to serve the disk image. Add the following location block:
+
+```nginx
+location /disk-images/ {
+	root .;
+	autoindex on;
+}
+```
+
+### 6, Start Nginx
+
+Run the following command to start Nginx:
+
+```sh
+nginx -p . -c nginx.conf
+```
+
+*Nginx will automatically serve the build directory.*
+
+### 7. Access WebVM
+
+Open a browser and visit: `http://127.0.0.1:8081`.
+
+Enjoy your local WebVM!
+
+---
+
+
 
 # Example customization: Python3 REPL
 
@@ -78,6 +215,37 @@ index 2878332..1f3103a 100644
 -CMD [ "/bin/bash" ]
 +CMD [ "/usr/bin/python3" ]
 ```
+
+# How to use Claude AI
+
+To access Claude AI, you need an API key. Follow these steps to get started:
+
+### 1. Create an account
+- Visit [Anthropic Console](https://console.anthropic.com/login) and sign up with your e-mail. You'll receive a sign in link to the Anthropic Console. 
+
+<img src="/assets/anthropic_signup.png" width="90%">
+
+### 2. Get your API key
+- Once logged in, navigate to **Get API keys**.
+- Purchase the amount of credits you need. After completing the purchase, you'll be able to generate the key through the API console.
+
+<img src="/assets/anthropic_api_payment.png" width="90%">
+
+### 3. Log in with your API key
+- Navigate to your WebVM and hover over the robot icon. This will show the Claude AI Integration tab. For added convenience, you can click the pin button in the top right corner to keep the tab in place.
+- You'll see a prompt where you can insert your Claude API key.
+- Insert your key and press enter.
+
+<img src="/assets/insert_key.png" width="90%">
+
+### 4. Start using Claude AI
+- Once your API key is entered, you can begin interacting with Claude AI by asking questions such as:
+
+ __"Solve the CTF challenge at `/home/user/chall1.bin.` Note that the binary reads from stdin."__
+
+<img src="/assets/webvm_claude_ctf.gif" alt="deploy_instructions_gif" width="90%">
+
+**Important:** Your API key is private and should never be shared. We do not have access to your key, which is not only stored locally in your browser.
 
 # Bugs and Issues
 
